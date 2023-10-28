@@ -224,9 +224,11 @@ impl VMManager {
 
             for chunk in overlapping_chunks.iter() {
                 match chunk.internal() {
-                    ChunkType::SingleVMA(_) => {
-                        internal_manager.munmap_chunk(chunk, Some(&munmap_range), false)?
-                    }
+                    ChunkType::SingleVMA(_) => internal_manager.munmap_chunk(
+                        chunk,
+                        Some(&munmap_range),
+                        MunmapChunkFlag::Default,
+                    )?,
                     ChunkType::MultiVMA(manager) => manager
                         .lock()
                         .unwrap()
@@ -247,7 +249,7 @@ impl VMManager {
                     .chunk_manager_mut()
                     .munmap_range(munmap_range);
             }
-            ChunkType::SingleVMA(_) => {
+            ChunkType::SingleVMA(vma) => {
                 // Single VMA Chunk could be updated during the release of internal manager lock. Get overlapping chunk again.
                 // This is done here because we don't want to acquire the big internal manager lock as soon as entering this function.
                 let mut internal_manager = self.internal();
@@ -262,7 +264,7 @@ impl VMManager {
                     return internal_manager.munmap_chunk(
                         &overlapping_chunk,
                         Some(&munmap_range),
-                        false,
+                        MunmapChunkFlag::Default,
                     );
                 } else {
                     warn!("no overlapping chunks anymore");
@@ -311,8 +313,23 @@ impl VMManager {
                     .chunk_manager_mut()
                     .mprotect(addr, size, perms);
             }
-            ChunkType::SingleVMA(_) => {
+            ChunkType::SingleVMA(vma) => {
                 let mut internal_manager = self.internal();
+
+                // There are rare cases that mutliple threads do mprotect or munmap for the same single-vma chunk
+                // but for different ranges and the cloned chunk is outdated when acquiring the InternalVMManger lock here.
+                //Thus, we search for the chunk again.
+                let chunk = {
+                    let current = current!();
+                    let process_mem_chunks = current.vm().mem_chunks().read().unwrap();
+                    let chunk = process_mem_chunks
+                        .iter()
+                        .find(|&chunk| chunk.range().is_superset_of(&protect_range));
+                    if chunk.is_none() {
+                        return_errno!(ENOMEM, "invalid mprotect range");
+                    }
+                    chunk.unwrap().clone()
+                };
                 return internal_manager.mprotect_single_vma_chunk(&chunk, protect_range, perms);
             }
         }
@@ -384,6 +401,10 @@ impl VMManager {
                     .msync_by_range(&sync_range);
             }
             ChunkType::SingleVMA(vma) => {
+                // Note: There are rare cases that mutliple threads do mprotect or munmap for the same single-vma chunk
+                // but for different ranges and the cloned chunk is outdated when the code reaches here.
+                // It is fine here because this function doesn't modify the global chunk list and only operates on the vma
+                // which is updated realtimely.
                 let vma = vma.lock().unwrap();
                 vma.flush_backed_file();
             }
@@ -512,7 +533,7 @@ impl VMManager {
         let mut mem_chunks = thread.vm().mem_chunks().write().unwrap();
 
         mem_chunks.iter().for_each(|chunk| {
-            internal_manager.munmap_chunk(&chunk, None, false);
+            internal_manager.munmap_chunk(&chunk, None, MunmapChunkFlag::OnProcessExit);
         });
         mem_chunks.clear();
 
@@ -588,7 +609,7 @@ impl InternalVMManager {
         &mut self,
         chunk: &ChunkRef,
         munmap_range: Option<&VMRange>,
-        force_unmap: bool,
+        flag: MunmapChunkFlag,
     ) -> Result<()> {
         trace!(
             "munmap_chunk range = {:?}, munmap_range = {:?}",
@@ -619,11 +640,11 @@ impl InternalVMManager {
 
         if chunk.is_shared() {
             trace!(
-                "munmap_shared_chunk, chunk_range: {:?}, munmap_range = {:?}",
+                "munmap_shared_chunk, chunk_range = {:?}, munmap_range = {:?}",
                 chunk.range(),
                 munmap_range,
             );
-            return self.munmap_shared_chunk(chunk, munmap_range, force_unmap);
+            return self.munmap_shared_chunk(chunk, munmap_range, flag);
         }
 
         // Either the munmap range is a subset of the chunk range or the munmap range is
@@ -743,7 +764,7 @@ impl InternalVMManager {
         &mut self,
         chunk: &ChunkRef,
         munmap_range: &VMRange,
-        force_unmap: bool,
+        flag: MunmapChunkFlag,
     ) -> Result<()> {
         if !chunk.is_shared() {
             return_errno!(EINVAL, "not a shared chunk");
@@ -754,7 +775,7 @@ impl InternalVMManager {
 
         if self
             .shm_manager
-            .munmap_shared_chunk(chunk, munmap_range, force_unmap)?
+            .munmap_shared_chunk(chunk, munmap_range, flag)?
             == MunmapSharedResult::Freeable
         {
             let vma = chunk.get_vma_for_single_vma_chunk();
@@ -1025,7 +1046,7 @@ impl InternalVMManager {
                             }
 
                             // Munmap the corresponding single vma chunk
-                            self.munmap_chunk(&chunk, Some(&target_range), true)?;
+                            self.munmap_chunk(&chunk, Some(&target_range), MunmapChunkFlag::Force)?;
                         }
                         VMMapAddr::Any => unreachable!(),
                     }
@@ -1145,6 +1166,17 @@ impl InternalVMManager {
 
         Ok(target_range.start())
     }
+}
+
+/// Flags used by `munmap_chunk()` and `munmap_shared_chunk()`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MunmapChunkFlag {
+    /// Indicates normal behavior when munamp a shared chunk
+    Default,
+    /// Indicates the shared chunk must be freed entirely
+    Force,
+    /// Indicates the shared chunk must detach current process totally
+    OnProcessExit,
 }
 
 impl VMRemapParser for InternalVMManager {
